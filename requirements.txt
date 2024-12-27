@@ -1,0 +1,6 @@
+ipdb
+matplotlib
+scikit-learn
+scipy
+tqdm
+pandas
