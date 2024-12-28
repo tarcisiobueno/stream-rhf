@@ -24,7 +24,7 @@ def get_kurtosis_feature_split(data, r):
 	constant_columns = data.columns[data.max() == data.min()]
 	data.loc[:, constant_columns] = np.nan
 	# if a column has same values, add Nan
-	kurtosis_values = kurtosis(data, fisher=False, nan_policy='omit')
+	kurtosis_values = kurtosis(data, fisher=False)
 
 	# MODIFIED
 	# Some values are nan, for now, we set them to 0.0
@@ -282,7 +282,7 @@ class RHF(object):
 
 	def compute_scores(self, instance_index):
      
-		normalized_index = self.window_size + instance_index % self.window_size
+		normalized_index = self.window_size - 1 + instance_index % self.window_size
 		self.scores = np.append(self.scores, 0)
 
 		for tree in self.forest:
@@ -303,7 +303,7 @@ class RHF(object):
 						break
 		return self.scores[normalized_index]
 
-	def fit(self, data):
+	def fit(self, data, compute_scores=True):
 		"""
 		Fit function: builds the ensemble and returns the scores
 
@@ -332,20 +332,21 @@ class RHF(object):
 
 			self.forest.append(randomHistogramTree)
 
-			if self.has_duplicates:
-				for leaf in randomHistogramTree.leaves:
-					samples_indexes = leaf.data_index
-					p = self.data_hash[samples_indexes].nunique()/self.uniques_
-					self.scores[samples_indexes %
-								self.window_size] += np.log(1/(p))
+			if compute_scores:
+				if self.has_duplicates:
+					for leaf in randomHistogramTree.leaves:
+						samples_indexes = leaf.data_index
+						p = self.data_hash[samples_indexes].nunique()/self.uniques_
+						self.scores[samples_indexes %
+									self.window_size] += np.log(1/(p))
 
-			else:
-				for leaf in randomHistogramTree.leaves:
-					samples_indexes = leaf.data_index
-					p = leaf.size/self.uniques_
-					self.scores[samples_indexes %
-								self.window_size] += np.log(1/(p))
-		return self.scores
+				else:
+					for leaf in randomHistogramTree.leaves:
+						samples_indexes = leaf.data_index
+						p = leaf.size/self.uniques_
+						self.scores[samples_indexes %
+									self.window_size] += np.log(1/(p))
+				return self.scores
 
 	def check_hash(self, data):
 		"""
@@ -446,7 +447,7 @@ if __name__ == "__main__":
 	data = df.drop('label', axis=1)
 
 	# maxtrix z E R ^ ( t x 2**h-1 ) (Number of nodes)
-	t = 10
+	t = 100
 	h = 5
 	z = np.random.rand(t, 2**h - 1)
 	n = 5  # percentage
@@ -463,13 +464,14 @@ if __name__ == "__main__":
 	# Go through each instance to simulate a stream
 
 	for i in tqdm(range(0, data.shape[0]), desc="Processing data"):
-
+     
 		current_window = pd.concat([current_window, data.iloc[i].to_frame().T])
-
-		if current_window.shape[0] % window_size == 0 and i > 0:
-
+  
+		if current_window.shape[0] == window_size:
 			reference_window = current_window.copy()
 			current_window = pd.DataFrame()
+
+		if (i+1) == window_size:
 
 			my_rhf = RHF(num_trees=t, max_height=h,
 						 split_criterion='kurtosis', z=z, window_size=window_size)
@@ -477,12 +479,11 @@ if __name__ == "__main__":
 			output_scores_l = my_rhf.fit(reference_window)
 			
 			# saves output score given by the initial RHF
-			if (i+1) == window_size:
-				all_output_scores.extend(output_scores_l)
+			all_output_scores.extend(output_scores_l)
 
-		elif reference_window.shape[0] >= window_size and current_window.shape[0] > 0:
-			new_instance, new_instance_index = data.iloc[i].to_frame(
-			).T, data.iloc[i].to_frame().T.index[0]
+		if (i+1) > window_size:
+			
+			new_instance, new_instance_index = data.iloc[i].to_frame().T, data.iloc[i].to_frame().T.index[0]
 			# with list comprehension
 			# [my_rhf.insert(tree, tree.tree_, tree.index, new_instance) for tree_i, tree in enumerate(my_rhf.forest)]
 			for tree_i, tree in enumerate(my_rhf.forest):
@@ -493,6 +494,11 @@ if __name__ == "__main__":
 			my_rhf.check_hash(pd.concat([reference_window, current_window]))
 			# compute score of the current instance
 			all_output_scores.append(my_rhf.compute_scores(new_instance_index))
+			if i % window_size == 0:
+				my_rhf = RHF(num_trees=t, max_height=h,
+						 split_criterion='kurtosis', z=z, window_size=window_size)
+   
+				my_rhf.fit(reference_window, compute_scores=False)				
 
 	# compute final metric
 	print(len(all_output_scores))
