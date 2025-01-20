@@ -442,9 +442,11 @@ if __name__ == "__main__":
 
 	dataset_name = "abalone"
 	df = pd.read_csv(f"../data/public/{dataset_name}.gz")
-	#df = df.iloc[:400]
+	df = df.iloc[:100]
 	labels = df['label']
 	data = df.drop('label', axis=1)
+ 
+	# start using numpy arrays from here
 
 	# maxtrix z E R ^ ( t x 2**h-1 ) (Number of nodes)
 	t = 100
