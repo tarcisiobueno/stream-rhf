@@ -312,7 +312,7 @@ class RHF(object):
 		self.scores = np.zeros(window_size)
 		self.number_instances = 0
 
-	def predict_single_tree_score(self, tree, node, tree_index, xi, xi_index):
+	def predict_single_tree_score(self, tree, node, tree_index, xi):
 		if node.type ==	1:
 			if node.has_duplicates:					
 				p = (1+node.uniques_)/self.number_instances
@@ -321,9 +321,9 @@ class RHF(object):
 				p = (1+node.size)/self.number_instances
 				return np.log(1/(p))
 		elif xi[0, node.attribute] <= node.value:
-			return self.predict_single_tree_score(tree, node.left, tree_index, xi, xi_index)
+			return self.predict_single_tree_score(tree, node.left, tree_index, xi)
 		else:
-			return self.predict_single_tree_score(tree, node.right, tree_index, xi, xi_index)
+			return self.predict_single_tree_score(tree, node.right, tree_index, xi)
   
 	def insert(self, tree, node, tree_index, xi, xi_index):
 		new_data = np.vstack([node.data, xi])
@@ -521,15 +521,16 @@ def main(dataset_name: str, shuffle: bool=True):
 			# This is the predict part
 			predicted_score = 0
 			for tree_i, tree in enumerate(my_rhf.forest):
-				predicted_score += my_rhf.predict_single_tree_score(tree, tree.tree_, tree.index, new_instance, i)
+				predicted_score += my_rhf.predict_single_tree_score(tree, tree.tree_, tree.index, new_instance)
 			print(predicted_score)
 			# This is the predict part
    
+			# training part
 			for tree_i, tree in enumerate(my_rhf.forest):				
 				my_rhf.insert(tree, tree.tree_, tree.index, new_instance, i)
 				# delete and add old and new leaves to the tree.leaves list
 				tree.reset_leaves()
-			toc = time.time()
+			# training part
 			
 			# check for duplicates - this may affect the score computation
 			#my_rhf.check_hash(np.vstack([reference_window, current_window]))
