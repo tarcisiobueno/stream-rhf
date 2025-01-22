@@ -20,9 +20,10 @@ def get_kurtosis_feature_split(data: np.ndarray, r: float) -> Tuple[int, float]:
         Tuple of (feature_index, feature_split)
     """
     # Handle constant columns
-    var = np.var(data, axis=0)
-    data = data.copy()
-    data[:, var == 0] = np.nan
+    #epsilon = 1e-8  # Threshold for near-constant variance
+    #var = np.var(data, axis=0)
+    #data = data.copy()
+    #data[:, var < epsilon] = np.nan
     
     # Calculate kurtosis values
     kurtosis_values = kurtosis(data, fisher=False, axis=0)
@@ -174,6 +175,9 @@ class RandomHistogramTree:
         indices = np.arange(data.shape[0])
         self.build(self.tree_, data, indices)
 
+from multiprocessing import Pool, cpu_count
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+
 class RHF:
     """Random Histogram Forest using NumPy arrays."""
     
@@ -245,34 +249,47 @@ class RHF:
                     
         return self.scores if compute_scores else None
 
-    def process_tree(self, tree_data: Tuple) -> None:
+    def process_tree_parallel(self, tree_data):
         """
         Process a single tree in parallel.
         
         Args:
-            tree_data: Tuple containing (tree, tree index, new instance, instance index)
+            tree_data: Tuple containing (tree_index, tree)
+        Returns:
+            Updated tree
         """
-        tree, tree_i, new_instance, instance_idx = tree_data
-        self.insert(tree, tree.tree_, tree.index, new_instance, instance_idx)
-        tree.reset_leaves()    
+        tree_i, tree = tree_data
+        tree = self.insert(tree, tree.tree_, tree.index, self.current_instance, self.current_index)
+        tree.reset_leaves()
+        return tree
     
-
-    def parallel_process_trees(self, new_instance: np.ndarray, instance_idx: int, max_workers: int = None) -> None:
+    def update_trees_parallel(self, new_instance, instance_index, n_jobs=None):
         """
-        Process trees in parallel using ThreadPoolExecutor.
+        Update all trees in parallel using multiprocessing.
         
         Args:
-            new_instance: New data instance to be inserted
-            instance_idx: Index of the instance
-            max_workers: Maximum number of parallel workers (default: None, uses CPU count)
+            new_instance: New data instance to insert
+            instance_index: Index of the instance
+            n_jobs: Number of processes to use (defaults to number of CPU cores)
         """
-        # Create list of arguments for each tree
-        tree_data = [(tree, i, new_instance, instance_idx) 
-                     for i, tree in enumerate(self.forest)]
+        if n_jobs is None:
+            n_jobs = cpu_count()
+            
+        # Store instance data as class attributes to avoid pickling issues
+        self.current_instance = new_instance
+        self.current_index = instance_index
         
-        # Process trees in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            list(executor.map(self.process_tree, tree_data))
+        # Create list of (tree_index, tree) tuples
+        tree_data = list(enumerate(self.forest))
+        
+        # Use multiprocessing to update trees in parallel
+        with Pool(processes=n_jobs) as pool:
+            # Update trees in parallel
+            updated_trees = pool.map(self.process_tree_parallel, tree_data)
+            
+        # Update forest with processed trees
+        self.forest = updated_trees
+        
 
 def average_precision(labels: np.ndarray, output_scores: np.ndarray) -> float:
     """
@@ -314,7 +331,7 @@ def main_parallel():
     # Load and prepare data
     dataset_name = "abalone"
     data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
-    #data = data[:100]
+    data = data[:100]
     labels = data[:, -1]
     features = data[:, :-1]
     
@@ -322,13 +339,12 @@ def main_parallel():
     t = 100  # number of trees
     h = 5    # max height
     z = np.random.rand(t, 2**h - 1)
-    n = 5    # percentage
-    window_size = int(features.shape[0] * n/100)
+    n = 1    # percentage
+    window_size = int(features.shape[0] * n / 100)
     
     # Initialize windows
     reference_window = np.array([]).reshape(0, features.shape[1])
     current_window = np.array([]).reshape(0, features.shape[1])
-    
     all_output_scores = []
     
     # Process stream
@@ -340,31 +356,40 @@ def main_parallel():
             reference_window = current_window.copy()
             current_window = np.array([]).reshape(0, features.shape[1])
             
-        if (i+1) == window_size:
-            my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis', 
-                        z=z, window_size=window_size)
+        if (i + 1) == window_size:
+            my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis', z=z, window_size=window_size)
             output_scores_l = my_rhf.fit(reference_window)
             all_output_scores.extend(output_scores_l)
             
-        if (i+1) > window_size:
+        if (i + 1) > window_size:
             new_instance = features[i:i+1]
             
-            # Replace the sequential processing with parallel processing
-            my_rhf.parallel_process_trees(new_instance, i, max_workers=10)
+            # Use parallel processing for tree processing
+            my_rhf.update_trees_parallel(new_instance, i, n_jobs=4)
             
             my_rhf.unique_instances = reference_window.shape[0] + current_window.shape[0]
             all_output_scores.append(my_rhf.compute_scores(i))
             
             if i % window_size == 0:
-                my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis',
-                        z=z, window_size=window_size)
+                my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis', z=z, window_size=window_size)
                 my_rhf.fit(reference_window, compute_scores=False)
+    
+    # Compute final metric
+    print(f"Number of scores: {len(all_output_scores)}")
+    average_precision_score = average_precision(labels, np.array(all_output_scores))
+    print(f"Average Precision Score: {average_precision_score}")
 
-def main():
+def main(dataset_name: str, shuffle: bool = True):
     # Load and prepare data
-    dataset_name = "abalone"
+    shuffle = shuffle
+    dataset_name = dataset_name
     data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
-    #data = data[:100]
+    scaler = MinMaxScaler()
+    data[:, :-1] = scaler.fit_transform(data[:, :-1])
+    if shuffle:
+        np.random.shuffle(data)
+        
+    #data = data[:150]
     labels = data[:, -1]
     features = data[:, :-1]
     
@@ -372,7 +397,7 @@ def main():
     t = 100  # number of trees
     h = 5    # max height
     z = np.random.rand(t, 2**h - 1)
-    n = 5    # percentage
+    n = 1    # percentage
     window_size = int(features.shape[0] * n/100)
     
     # Initialize windows
@@ -385,12 +410,13 @@ def main():
     for i in tqdm(range(features.shape[0]), desc="Processing data"):
         current_instance = features[i:i+1]
         current_window = np.vstack([current_window, current_instance]) if current_window.size else current_instance
-        
+                
         if current_window.shape[0] == window_size:
             reference_window = current_window.copy()
             current_window = np.array([]).reshape(0, features.shape[1])
             
         if (i+1) == window_size:
+            tic = time.time()
             my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis', 
                         z=z, window_size=window_size)
             output_scores_l = my_rhf.fit(reference_window)
@@ -402,6 +428,7 @@ def main():
             for tree_i, tree in enumerate(my_rhf.forest):
                 my_rhf.insert(tree, tree.tree_, tree.index, new_instance, i)
                 tree.reset_leaves()
+
                 
             my_rhf.unique_instances = reference_window.shape[0] + current_window.shape[0]
             all_output_scores.append(my_rhf.compute_scores(i))
@@ -410,11 +437,18 @@ def main():
                 my_rhf = RHF(num_trees=t, max_height=h, split_criterion='kurtosis',
                            z=z, window_size=window_size)
                 my_rhf.fit(reference_window, compute_scores=False)
+
+    return average_precision(labels, np.array(all_output_scores))
     
-    # Compute final metric
-    print(f"Number of scores: {len(all_output_scores)}")
-    average_precision_score = average_precision(labels, np.array(all_output_scores))
-    print(f"Average Precision Score: {average_precision_score}")
 
 if __name__ == "__main__":
-    main_parallel()
+    #datasets = ["abalone", "annthyroid", "kdd_ftp", "cardio", "magicgamma", "mammography", "mnist", "musk","satellite", "satimages", "spambase","thyroid"]
+    datasets = sys.argv[1:]  # Get dataset names from command line arguments
+    for i, dataset in enumerate(datasets):
+        for j in range(15):
+            print(f"Dataset: {dataset} - Iteration: {j}")
+            avg_score = main(dataset, shuffle=True),
+            print(f"Average Precision Score: {avg_score}")
+            # save avg_score to file
+            with open(f"./results/{dataset}.csv", "a") as f:
+                f.write(f"{j},{avg_score[0]}\n")

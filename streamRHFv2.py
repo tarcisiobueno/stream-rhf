@@ -4,11 +4,52 @@ from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
 from typing import List, Tuple
-from scipy.stats import kurtosis
+#from scipy.stats import kurtosis
 import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from tqdm import tqdm
+
+
+def kurtosis_(data: np.ndarray) -> np.ndarray:
+	n = data.shape[0]
+	mean = np.mean(data, axis=0)
+	std = np.std(data, axis=0, ddof=0)  # Use ddof=0 for population std
+	
+	# Avoid division by zero: mask constant columns
+	is_constant = std == 0
+	kurt = np.zeros(data.shape[1])
+	
+	# Compute kurtosis only for non-constant columns
+	non_constant_indices = ~is_constant
+	if np.any(non_constant_indices):  # Proceed only if there are non-constant columns
+		centered = data[:, non_constant_indices] - mean[non_constant_indices]
+		kurt[non_constant_indices] = (
+			np.sum(centered**4, axis=0) / (n * std[non_constant_indices]**4)
+		)
+	
+	return kurt
+
+def kurtosis(data: np.ndarray) -> np.ndarray:
+	'''
+	Biased estimator for the kurtosis of a dataset.
+ 	'''
+	n = data.shape[0]
+	mean = np.mean(data, axis=0)
+	std = np.std(data, axis=0)
+	
+	# Avoid division by zero: mask constant columns
+	is_constant = np.std(data, axis=0) == 0
+	kurt = np.zeros(data.shape[1])
+	
+	# Compute kurtosis only for non-constant columns
+	non_constant_indices = ~is_constant
+	centered = data[:, non_constant_indices] - mean[non_constant_indices]
+	
+	kurt[non_constant_indices] = (1/n)*np.sum(centered**4, axis=0) / ((1/n)*np.sum(centered**2, axis=0))**2
+	return kurt
+
+
 
 
 def get_kurtosis_feature_split(data, r):
@@ -20,15 +61,11 @@ def get_kurtosis_feature_split(data, r):
 									- feature_index: the attribute index to split
 									- feature_split: the attribute value to split
 	"""
-	data = data.copy()
-	constant_columns = data.columns[data.max() == data.min()]
-	data.loc[:, constant_columns] = np.nan
-	# if a column has same values, add Nan
-	kurtosis_values = kurtosis(data, fisher=False)
 
-	# MODIFIED
+	kurtosis_values = kurtosis(data)
+
 	# Some values are nan, for now, we set them to 0.0
-	kurtosis_values = np.nan_to_num(kurtosis_values, nan=0.0)
+	#kurtosis_values = np.nan_to_num(kurtosis_values, nan=0.0)
 
 	kurtosis_values_log = np.log(kurtosis_values+1)
 
@@ -38,15 +75,14 @@ def get_kurtosis_feature_split(data, r):
 		# random_value_feature = np.random.uniform(0, kurtosis_values_sum_log)
 		# MODIFIED
 		r_adjusted = r * kurtosis_values_sum_log
-		feature_index = np.digitize(
-			r_adjusted, np.cumsum(kurtosis_values_log), right=True)
-		min_ = np.min(data.iloc[:, feature_index])
-		max_ = np.max(data.iloc[:, feature_index])
-		feature_split = np.random.uniform(min_, max_)
-		if min_ < feature_split < max_:
+		feature_index = np.digitize(r_adjusted, np.cumsum(kurtosis_values_log), right=True)
+		min_ = np.min(data[:, feature_index])
+		max_ = np.max(data[:, feature_index])
+		feature_value = np.random.uniform(min_, max_)
+		if min_ < feature_value < max_ or min_ == max_:
 			break
 
-	return feature_index, feature_split
+	return feature_index, feature_value
 
 
 def get_random_feature_split(data):
@@ -96,7 +132,38 @@ class Node(object):
 		self.index = None
 		self.type = 0
 		self.parent = None
+		self.uniques_ = 0
+		self.uniques_dict_ = {}
+		self.has_duplicates = False
+	
+	def check_hash(self, data):
+		"""
+		Checks if there are duplicates in the dataset
 
+		:param data: dataset
+		"""
+		
+		if np.unique(data, axis=0).shape[0] < data.shape[0]:
+			self.has_duplicates = True
+			self.get_hash_numpy(data)
+			self.uniques_ = len(self.uniques_dict_)
+		else:
+			self.uniques_ = data.shape[0]
+	
+   
+	def get_hash_numpy(self, data):
+		rows_as_tuples = [tuple(row) for row in data]		
+		for row in rows_as_tuples:
+			self.uniques_dict_[row] = self.uniques_dict_.get(row, np.array(row)) + 1
+	
+	def get_hash(self, data):
+		"""
+		Builds hash of data for duplicates identification
+
+		:param data: dataset
+		"""
+		data_df = pd.DataFrame(data)
+		self.data_hash = data_df.apply(lambda row: hash('-'.join([str(x) for x in row])), axis=1)	
 
 class Root(Node):
 	"""
@@ -117,7 +184,7 @@ class RandomHistogramTree(object):
 	:param bool split_criterion: split criterion to use: 'kurtosis' or 'random'
 	"""
 
-	def __init__(self, z, window_size, index, data=None, max_height=None, split_criterion='kurtosis'):
+	def __init__(self, z, window_size, index, data=None, max_height=None, split_criterion='kurtosis', check_duplicates=True):
 		super(RandomHistogramTree, self).__init__()
 		self.N = 0
 		self.leaves = []
@@ -126,6 +193,8 @@ class RandomHistogramTree(object):
 		self.index = index
 		self.z = z
 		self.window_size = window_size
+		self.check_duplicates = check_duplicates
+		
 
 		if data is not None:
 			self.build_tree(data)
@@ -161,7 +230,7 @@ class RandomHistogramTree(object):
 		self.leaves = []
 		traverse(self.tree_)
 
-	def set_leaf(self, node, data):
+	def set_leaf(self, node, data, indices: np.ndarray):
 		"""
 		Transforms generic node into leaf
 
@@ -170,37 +239,36 @@ class RandomHistogramTree(object):
 		"""
 		node.type = 1
 		node.size = data.shape[0]
-		node.data_index = data.index
+		node.data_indices = indices
+		node.get_hash(data)
 		node.data = data.copy()
 		self.leaves.append(node)
 
-	def build(self, node, data):
+	def build(self, node: Node, data: np.ndarray, indices: np.ndarray):
 		"""
 		Function which recursively builds the tree
 
 		:param node: current node
 		:param data: data corresponding to current node
 		"""
-		node.data_index = data.index
+		node.data_indices = indices
 		node.data = data
-
-		node_tree_i = self.index
 
 		if data.shape[0] == 0:
 			self.error_node = node
 		if data.shape[0] <= 1:
-			self.set_leaf(node, data)
+			self.set_leaf(node, data, indices)
 			return
-		if data.duplicated().sum() == data.shape[0] - 1:
-			self.set_leaf(node, data)
+		if np.unique(data, axis=0).shape[0] == 1:
+			self.set_leaf(node, data, indices)
 			return
 		if node.depth >= self.max_height:
-			self.set_leaf(node, data)
+			self.set_leaf(node, data, indices)
 			return
 
 		if self.split_criterion == 'kurtosis':
 			attribute, value = get_kurtosis_feature_split(
-				data, self.z[node_tree_i, node.index % (self.z.shape[1]-1)])
+				data, self.z[self.index, node.index % (self.z.shape[1]-1)])
 		elif self.split_criterion == 'random':
 			attribute, value = get_random_feature_split(data)
 		else:
@@ -212,8 +280,9 @@ class RandomHistogramTree(object):
 		node.attribute = attribute
 		node.value = value
 
-		self.build(node.left, data[data.iloc[:, attribute] < value])
-		self.build(node.right, data[data.iloc[:, attribute] >= value])
+		mask = data[:, attribute] < value
+		self.build(node.left, data[mask], indices[mask])
+		self.build(node.right, data[~mask], indices[~mask])
 
 	def build_tree(self, data):
 		"""
@@ -222,7 +291,8 @@ class RandomHistogramTree(object):
 		:param data: the dataset
 		"""
 		self.tree_ = Root()
-		self.build(self.tree_, data)
+		indices = np.arange(data.shape[0])
+		self.build(self.tree_, data, indices)
 
 	def get_data_indexes(self):
 		"""
@@ -230,7 +300,7 @@ class RandomHistogramTree(object):
 
 		:returns: A set of data indexes of the leaves.
 		"""
-		return set([index for leaf in self.leaves for index in leaf.data_index.tolist()])
+		return set([index for leaf in self.leaves for index in leaf.data_indices.tolist()])
 
 	# def get_leaves(self, node, leaves):
 
@@ -262,43 +332,42 @@ class RHF(object):
 		self.z = z
 		self.window_size = window_size
 		self.scores = np.zeros(window_size)
+		self.number_instances = 0
 
-	def insert(self, tree, node, tree_index, xi):
-		new_data = pd.concat([node.data, xi])
+	def insert(self, tree, node, tree_index, xi, xi_index):
+		new_data = np.vstack([node.data, xi])
+		new_indices = np.append(node.data_indices, xi_index)
 		# loop trough all trees of the forest
 		if node.type == 0:
 			attribute, value = get_kurtosis_feature_split(
 				new_data, self.z[tree_index, node.index % (self.z.shape[1]-1)])
 			if attribute != node.attribute:
-				tree.build(node, new_data)
+				tree.build(node, new_data, new_indices)
 				return tree
-			elif xi.iloc[0, node.attribute] <= node.value:
-				self.insert(tree, node.left, tree_index, xi)
+			elif xi[0, node.attribute] <= node.value:
+				self.insert(tree, node.left, tree_index, xi, xi_index)
 			else:
-				self.insert(tree, node.right, tree_index, xi)
+				self.insert(tree, node.right, tree_index, xi, xi_index)
 		else:
-			tree.build(node, new_data)
+			tree.build(node, new_data, new_indices)
 		return tree
 
 	def compute_scores(self, instance_index):
-     
+	 
 		normalized_index = self.window_size - 1 + instance_index % self.window_size
 		self.scores = np.append(self.scores, 0)
 
 		for tree in self.forest:
-			if self.has_duplicates:
-				for leaf in tree.leaves:
-					samples_indexes = leaf.data_index
+			for leaf in tree.leaves:
+				samples_indexes = leaf.data_indices
+				if leaf.has_duplicates:					
 					if instance_index in samples_indexes:
-						p = self.data_hash[samples_indexes].nunique(
-						)/self.uniques_
+						p = leaf.uniques_/self.number_instances
 						self.scores[normalized_index] += np.log(1/(p))
 						break
-			else:
-				for leaf in tree.leaves:
-					samples_indexes = leaf.data_index
+				else:
 					if instance_index in samples_indexes:
-						p = leaf.size/self.uniques_
+						p = leaf.size/self.number_instances
 						self.scores[normalized_index] += np.log(1/(p))
 						break
 		return self.scores[normalized_index]
@@ -310,11 +379,7 @@ class RHF(object):
 		:param data: the dataset to fit
 		:return scores: anomaly scores
 		"""
-
-		data = pd.DataFrame(data)
-
-		self.check_hash(data)
-
+		self.number_instances = data.shape[0]
 		self.forest = []
 
 		for tree_id in range(self.num_trees):
@@ -333,45 +398,17 @@ class RHF(object):
 			self.forest.append(randomHistogramTree)
 
 			if compute_scores:
-				if self.has_duplicates:
-					for leaf in randomHistogramTree.leaves:
-						samples_indexes = leaf.data_index
-						p = self.data_hash[samples_indexes].nunique()/self.uniques_
+				for leaf in randomHistogramTree.leaves:
+					samples_indexes = leaf.data_indices
+					if leaf.has_duplicates:
+						p = self.data_hash[samples_indexes].nunique()/self.number_instances
 						self.scores[samples_indexes %
 									self.window_size] += np.log(1/(p))
-
-				else:
-					for leaf in randomHistogramTree.leaves:
-						samples_indexes = leaf.data_index
-						p = leaf.size/self.uniques_
+					else:
+						p = leaf.size/self.number_instances
 						self.scores[samples_indexes %
 									self.window_size] += np.log(1/(p))
 				return self.scores
-
-	def check_hash(self, data):
-		"""
-		Checks if there are duplicates in the dataset
-
-		:param data: dataset
-		"""
-		if self.check_duplicates:
-			if data.duplicated().sum() > 0:
-				self.has_duplicates = True
-				self.get_hash(data)
-				self.uniques_ = self.data_hash.nunique()
-			else:
-				self.uniques_ = data.shape[0]
-		else:
-			self.uniques_ = data.shape[0]
-
-	def get_hash(self, data):
-		"""
-		Builds hash of data for duplicates identification
-
-		:param data: dataset
-		"""
-		self.data_hash = data.apply(lambda row: hash(
-			'-'.join([str(x) for x in row])), axis=1)
 
 	def get_data_indexes(self):
 		"""
@@ -438,13 +475,12 @@ def average_precision(labels, output_scores):
 	return ap
 
 def main(dataset_name: str, shuffle: bool=True):
-	dataset_name = "abalone"
-	df = pd.read_csv(f"../data/public/{dataset_name}.gz")
+	data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
 	if shuffle:
-		df = df.sample(frac=1).reset_index(drop=True)
-	#df = df.iloc[:150]
-	labels = df['label']
-	data = df.drop('label', axis=1)
+		np.random.shuffle(data)
+	#data = data[:150]
+	labels = data[:, -1]
+	features = data[:, :-1]
  
 	# start using numpy arrays from here
 
@@ -457,8 +493,8 @@ def main(dataset_name: str, shuffle: bool=True):
  
  	# create reference_window and current_window
 
-	reference_window = pd.DataFrame()
-	current_window = pd.DataFrame()
+	reference_window = np.array([]).reshape(0, features.shape[1])
+	current_window = np.array([]).reshape(0, features.shape[1])
 
 	AP_scores = []
 	all_output_scores = []
@@ -466,12 +502,13 @@ def main(dataset_name: str, shuffle: bool=True):
 	# Go through each instance to simulate a stream
 
 	for i in tqdm(range(0, data.shape[0]), desc="Processing data"):
-     
-		current_window = pd.concat([current_window, data.iloc[i].to_frame().T])
+	 
+		current_instance = features[i:i+1]
+		current_window = np.vstack([current_window, current_instance]) if current_window.size else current_instance
   
 		if current_window.shape[0] == window_size:
 			reference_window = current_window.copy()
-			current_window = pd.DataFrame()
+			current_window = np.array([]).reshape(0, features.shape[1])
 
 		if (i+1) == window_size:
 
@@ -485,23 +522,26 @@ def main(dataset_name: str, shuffle: bool=True):
 
 		if (i+1) > window_size:
 			
-			new_instance, new_instance_index = data.iloc[i].to_frame().T, data.iloc[i].to_frame().T.index[0]
+			new_instance = features[i:i+1]
+			my_rhf.number_instances += 1
 			# with list comprehension
 			# [my_rhf.insert(tree, tree.tree_, tree.index, new_instance) for tree_i, tree in enumerate(my_rhf.forest)]
-			for tree_i, tree in enumerate(my_rhf.forest):
-				my_rhf.insert(tree, tree.tree_, tree.index, new_instance)
+			
+			for tree_i, tree in enumerate(my_rhf.forest):				
+				my_rhf.insert(tree, tree.tree_, tree.index, new_instance, i)
 				# delete and add old and new leaves to the tree.leaves list
 				tree.reset_leaves()
+			toc = time.time()
+			
 			# check for duplicates - this may affect the score computation
-			my_rhf.check_hash(pd.concat([reference_window, current_window]))
+			#my_rhf.check_hash(np.vstack([reference_window, current_window]))
 			# compute score of the current instance
-			all_output_scores.append(my_rhf.compute_scores(new_instance_index))
+			all_output_scores.append(my_rhf.compute_scores(i))
 			if i % window_size == 0:
 				my_rhf = RHF(num_trees=t, max_height=h,
 						 split_criterion='kurtosis', z=z, window_size=window_size)
    
-				my_rhf.fit(reference_window, compute_scores=False)				
-
+				my_rhf.fit(reference_window, compute_scores=False)		
 	# compute final metric
 
 	all_output_scores = pd.Series(all_output_scores)
@@ -509,14 +549,14 @@ def main(dataset_name: str, shuffle: bool=True):
 	return average_precision_score
 
 if __name__ == "__main__":
-    #datasets = ["abalone", "annthyroid", "kdd_ftp", "cardio", "magicgamma", "mammography", "mnist", "musk","satellite", "satimages", "spambase","thyroid"]
-    datasets = sys.argv[1:]  # Get dataset names from command line arguments
-    for i, dataset in enumerate(datasets):
-        for j in range(15):
-            print(f"Dataset: {dataset} - Iteration: {j}")
-            avg_score = main(dataset, shuffle=True),
-            print(f"Average Precision Score: {avg_score}")
-            # save avg_score to file
-            with open(f"./resultsRHF/{dataset}.csv", "a") as f:
-                f.write(f"{j},{avg_score[0]}\n")
+	#datasets = ["abalone", "annthyroid", "kdd_ftp", "cardio", "magicgamma", "mammography", "mnist", "musk","satellite", "satimages", "spambase","thyroid"]
+	datasets = sys.argv[1:]  # Get dataset names from command line arguments
+	for i, dataset in enumerate(datasets):
+		for j in range(15):
+			print(f"Dataset: {dataset} - Iteration: {j}")
+			avg_score = main(dataset, shuffle=True),
+			print(f"Average Precision Score: {avg_score}")
+			# save avg_score to file
+			with open(f"./resultsRHF/{dataset}.csv", "a") as f:
+				f.write(f"{j},{avg_score[0]}\n")
 
