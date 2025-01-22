@@ -2,11 +2,11 @@
 from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
-from typing import List, Tuple
+from typing import List
 from scipy.stats import kurtosis
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, precision_recall_curve
+from sklearn.metrics import average_precision_score
 from tqdm import tqdm
 
 # Libraries for profiling
@@ -78,6 +78,7 @@ Get attribute split according to Kurtosis Split.
 
 class TreeNode:
     """Flat array representation of a tree node."""
+
     def __init__(self):
         self.left = -1  # Index of the left child
         self.right = -1  # Index of the right child
@@ -91,12 +92,13 @@ class TreeNode:
 
 class RandomHistogramTreeArray:
     """Array-based Random Histogram Tree."""
+
     def __init__(self, data, z, tree_index, max_height, split_criterion='kurtosis'):
         self.z = z
         self.tree_index = tree_index
         self.max_height = max_height
         self.split_criterion = split_criterion
-        self.tree:List[TreeNode] = [] # Array of TreeNodes
+        self.tree: List[TreeNode] = []  # Array of TreeNodes
         self.data = None
         self.data_len = 0
 
@@ -114,7 +116,7 @@ class RandomHistogramTreeArray:
             root.data_indices = np.arange(data.shape[0])
             self.tree.append(root)
 
-        stack = [node_index] 
+        stack = [node_index]
 
         while stack:
             node_index = stack.pop()
@@ -128,18 +130,20 @@ class RandomHistogramTreeArray:
             # Determine split criterion
             if self.split_criterion == 'kurtosis':
                 attribute, value = get_kurtosis_feature_split(
-                    self.data[node.data_indices], 
+                    self.data[node.data_indices],
                     self.z[self.tree_index, node_index % (self.z.shape[1] - 1)]
                 )
             else:
                 pass
-                #attribute, value = get_random_feature_split(self.data[node.data_indices])
+                # attribute, value = get_random_feature_split(self.data[node.data_indices])
 
             node.split_feature = attribute
             node.split_value = value
 
-            left_indices = node.data_indices[self.data[node.data_indices, attribute] < value]
-            right_indices = node.data_indices[self.data[node.data_indices, attribute] >= value]
+            left_indices = node.data_indices[self.data[node.data_indices,
+                                                       attribute] < value]
+            right_indices = node.data_indices[self.data[node.data_indices,
+                                                        attribute] >= value]
 
             left_node = TreeNode()
             left_node.data_indices = left_indices
@@ -169,6 +173,7 @@ class RandomHistogramTreeArray:
         node = self.tree[node_index]
         p = len(np.unique(node.data_indices)) / self.data_len
         return np.log(1 / p)
+
 
 class RHF:
     """
@@ -201,26 +206,41 @@ class RHF:
 
         scores = np.zeros(data.shape[0])
 
-        for tree_id in range(self.num_trees):
-            tree = RandomHistogramTreeArray(
-                data=data,
-                max_height=self.max_height,
-                split_criterion=self.split_criterion,
-                z=self.z,
-                tree_index=tree_id
-            )
-            self.forest.append(tree)
+        # Parallelize tree construction
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for tree_id in range(self.num_trees):
+                futures.append(executor.submit(
+                    self._build_tree, tree_id, data))
 
-            if compute_scores:
-                for i in range(data.shape[0]):
-                    scores[i] += tree.predict(data[i])
+            for future in futures:
+                tree = future.result()
+                self.forest.append(tree)
 
         if compute_scores:
-            scores /= self.num_trees
+            for i in range(data.shape[0]):
+                scores[i] = sum(tree.predict(data[i])
+                                for tree in self.forest) / self.num_trees
 
         return scores
 
-    def insert(self, instance:np.ndarray, tree:RandomHistogramTreeArray, node_index=0):
+    def _build_tree(self, tree_id, data):
+        """
+        Helper function to build an individual tree.
+        :param tree_id: ID of the tree being built.
+        :param data: The dataset for the tree.
+        :return: The constructed RandomHistogramTreeArray.
+        """
+        tree = RandomHistogramTreeArray(
+            data=data,
+            max_height=self.max_height,
+            split_criterion=self.split_criterion,
+            z=self.z,
+            tree_index=tree_id
+        )
+        return tree
+
+    def insert(self, instance: np.ndarray, tree: RandomHistogramTreeArray, node_index=0):
         """
         Inserts a new data point into each tree in the forest.
 
@@ -239,13 +259,12 @@ class RHF:
             if attribute != node.split_feature:
                 tree.build_node(new_data, node_index)
                 return tree
-            elif instance[:,node.split_feature] <= node.split_value:
+            elif instance[:, node.split_feature] <= node.split_value:
                 self.insert(instance, tree, node_index=node.left)
             else:
                 self.insert(instance, tree, node_index=node.right)
         else:
             tree.build_node(new_data, node_index)
-
 
     def predict(self, instance):
         """
@@ -254,7 +273,8 @@ class RHF:
         :param instance: The data point to predict.
         :return: The anomaly score for the instance.
         """
-        score = sum(tree.predict(instance) for tree in self.forest) / self.num_trees
+        score = sum(tree.predict(instance)
+                    for tree in self.forest) / self.num_trees
         return score
 
 
@@ -306,6 +326,11 @@ def average_precision(labels, output_scores):
     return ap
 
 
+def insert_tree(tree, new_instance, rhf):
+    """Function to insert new_instance into a specific tree."""
+    rhf.insert(new_instance, tree, node_index=0)
+
+
 if __name__ == "__main__":
 
     dataset_name = "abalone"
@@ -334,7 +359,10 @@ if __name__ == "__main__":
 
     profiler = cProfile.Profile()
     profiler.enable()
-    
+
+    def insert_tree(args):
+        tree, instance, rhf = args
+        rhf.insert(instance, tree, node_index=0)
 
     for i in tqdm(range(0, data.shape[0]), desc="Processing data"):
         current_window = np.vstack((current_window, data[i].reshape(1, -1)))
@@ -360,9 +388,9 @@ if __name__ == "__main__":
 
             new_instance = data[i].reshape(1, -1)
 
-            # Insert the new instance into the RHF
-            for tree in my_rhf.forest:
-                my_rhf.insert(new_instance, tree, node_index=0)
+            with ThreadPoolExecutor() as executor:
+                executor.map(insert_tree, my_rhf.forest, [
+                             new_instance] * len(my_rhf.forest), [my_rhf] * len(my_rhf.forest))
 
             # compute score of the current instance
             all_output_scores.append(my_rhf.predict(data[i]))
