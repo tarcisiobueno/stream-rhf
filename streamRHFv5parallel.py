@@ -1,6 +1,8 @@
 """Main module."""
 
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Pool
+import os
 import sys
 import time
 from typing import List, Tuple
@@ -9,25 +11,26 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from tqdm import tqdm
-import logging
 
-logging.basicConfig(level=logging.DEBUG)  # Set the log level to DEBUG
 
 def kurtosis(data: np.ndarray) -> np.ndarray:
-    n = data.shape[0]
-    mean = np.mean(data, axis=0)
-    std = np.std(data, axis=0)
-    
-    # Avoid division by zero: mask constant columns
-    is_constant = np.std(data, axis=0) == 0
-    kurt = np.zeros(data.shape[1])
-    
-    # Compute kurtosis only for non-constant columns
-    non_constant_indices = ~is_constant
-    centered = data[:, non_constant_indices] - mean[non_constant_indices]
-    kurt[non_constant_indices] = np.sum(centered**4, axis=0) / ((n-1) * std[non_constant_indices]**4)
-    return kurt
-
+	'''
+	Biased estimator for the kurtosis of a dataset.
+ 	'''
+	n = data.shape[0]
+	mean = np.mean(data, axis=0)
+	std = np.std(data, axis=0)
+	
+	# Avoid division by zero: mask constant columns
+	is_constant = np.std(data, axis=0) == 0
+	kurt = np.zeros(data.shape[1])
+	
+	# Compute kurtosis only for non-constant columns
+	non_constant_indices = ~is_constant
+	centered = data[:, non_constant_indices] - mean[non_constant_indices]
+	
+	kurt[non_constant_indices] = (1/n)*np.sum(centered**4, axis=0) / ((1/n)*np.sum(centered**2, axis=0))**2
+	return kurt
 
 def get_kurtosis_feature_split(data, r):
 	"""
@@ -403,58 +406,13 @@ class RHF(object):
 		"""
 		return sum([1 for tree in self.forest for leaf in tree.leaves if leaf.size == 1])
 
+from sklearn.metrics import precision_recall_curve, auc, average_precision_score
 
-def average_precision(labels, output_scores):
-	"""
-	Compute Average Precision (AP) score.
 
-	:param labels: True binary labels (0 or 1) as a pandas Series or numpy array.
-	:param output_scores: Predicted scores as a pandas Series or numpy array.
-	:returns: The Average Precision (AP) score.
-	"""
-	# Ensure labels and output_scores are numpy arrays
-	labels = np.array(labels)
-	output_scores = np.array(output_scores)
-
-	# Sort by output_scores in descending order
-	sorted_indices = np.argsort(output_scores)[::-1]
-	sorted_labels = labels[sorted_indices]
-	sorted_scores = output_scores[sorted_indices]
-
-	# Compute Precision and Recall at each threshold
-	tp = 0  # True Positives
-	fp = 0  # False Positives
-	n_positives = np.sum(labels)
-
-	precisions = []
-	recalls = []
-
-	for i in range(len(sorted_labels)):
-		if sorted_labels[i] == 1:
-			tp += 1
-		else:
-			fp += 1
-
-		precision = tp / (tp + fp)
-		recall = tp / n_positives
-
-		precisions.append(precision)
-		recalls.append(recall)
-
-	# Compute AP as the weighted mean of precisions at each recall step
-	ap = 0.0
-	previous_recall = 0.0
-
-	for p, r in zip(precisions, recalls):
-		ap += p * (r - previous_recall)
-		previous_recall = r
-
-	return ap
-
-def main(dataset_name: str, shuffle: bool=True):
-	data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
-	if shuffle:
-		np.random.shuffle(data)
+def main(data: str):
+	#data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
+	#if shuffle:
+	#	np.random.shuffle(data)
 	#data = data[:150]
 	labels = data[:, -1]
 	features = data[:, :-1]
@@ -493,7 +451,6 @@ def main(dataset_name: str, shuffle: bool=True):
 						 split_criterion='kurtosis', z=z, window_size=window_size)
    
 			output_scores_l = my_rhf.fit(reference_window)
-			print(output_scores_l)
 			
 			# saves output score given by the initial RHF
 			all_output_scores.extend(output_scores_l)
@@ -521,20 +478,41 @@ def main(dataset_name: str, shuffle: bool=True):
    
 				my_rhf.fit(reference_window, compute_scores=False)		
 	# compute final metric
+	av_precision = average_precision_score(labels, all_output_scores)
+	return av_precision
 
-	all_output_scores = pd.Series(all_output_scores)
-	average_precision_score = average_precision(labels, all_output_scores)
-	return average_precision_score
+def process_dataset_iteration(args):
+	dataset_name, data, iteration = args
+ 
+	tic = time.time()
+	av_precision = main(data)
+	toc = time.time()
+				
+	return dataset_name, iteration, av_precision, toc - tic
 
 if __name__ == "__main__":
 	#datasets = ["abalone", "annthyroid", "kdd_ftp", "cardio", "magicgamma", "mammography", "mnist", "musk","satellite", "satimages", "spambase","thyroid"]
 	datasets = sys.argv[1:]  # Get dataset names from command line arguments
-	for i, dataset in enumerate(datasets):
-		for j in range(15):
-			print(f"Dataset: {dataset} - Iteration: {j}")
-			avg_score = main(dataset, shuffle=True),
-			print(f"Average Precision Score: {avg_score}")
-			# save avg_score to file
-			with open(f"./resultsRHF/{dataset}.csv", "a") as f:
-				f.write(f"{j},{avg_score[0]}\n")
+	for dataset_name in datasets:
+		data = np.loadtxt(f"../data/public/{dataset_name}.gz", delimiter=",", skiprows=1)
+		#data = data[:150]
+		# Create all dataset-iteration combinations
+		tasks = []
+		for i in range(15):
+			np.random.shuffle(data)
+			tasks.append((dataset_name, data.copy(), i))
+		# Get number of CPU cores
+		num_cores = os.cpu_count()		
+		# Create process pool and run tasks
+		with Pool(processes=num_cores) as pool:
+			results = pool.map(process_dataset_iteration, tasks)
+		
+		# Process results
+		for dataset_name, iteration, score, time_elapsed in results:
+			if score is not None:
+				with open(f"./resultsRHFv5/{dataset_name}.csv", "a") as f:
+					f.write(f"{iteration},{score},{time_elapsed}\n")
+				print(f"Completed {dataset_name} iteration {iteration} with score {score}")
+			else:
+				print(f"Failed to process {dataset_name} iteration {iteration}")
 
