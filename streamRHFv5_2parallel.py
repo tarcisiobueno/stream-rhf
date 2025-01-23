@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from typing import List, Tuple
+import warnings
 #from scipy.stats import kurtosis
 import numpy as np
 import pandas as pd
@@ -16,6 +17,21 @@ from tqdm import tqdm
 def get_row_hash(row, precision=5):
 	# Ensure the row is a list of numeric values (e.g., float)
 	return '|'.join(map(lambda x: f"{float(x):.{precision}f}", row.tolist()))
+
+def kurtosis_test(data) -> np.ndarray:
+	'''
+	Unbiased estimator for the kurtosis of a dataset.
+	'''	
+	n = data.shape[0]
+	mean = np.mean(data, axis=0)  # Calculate the mean for each column
+	centered = data - mean
+	M4 = np.mean(centered**4, axis=0)
+	k = kurtosis(data)
+	kurt = np.zeros(k.shape[0])
+	mask_m4 = M4 != 0
+	kurt = ((n-1)/((n-2)*(n-3)))*((n-1)*k[mask_m4]-3*(n-1)) + 3
+	print(f"Kurtosis: {kurt}")
+	return kurt
 
 def kurtosis(data: np.ndarray) -> np.ndarray:
 	'''
@@ -33,7 +49,11 @@ def kurtosis(data: np.ndarray) -> np.ndarray:
 	non_constant_indices = ~is_constant
 	centered = data[:, non_constant_indices] - mean[non_constant_indices]
 	
-	kurt[non_constant_indices] = (1/n)*np.sum(centered**4, axis=0) / ((1/n)*np.sum(centered**2, axis=0))**2
+	
+	#kurt[non_constant_indices] = (1/n)*np.sum(centered**4, axis=0) / ((1/n)*np.sum(centered**2, axis=0))**2
+	kurt[non_constant_indices] = (1/n)*np.sum(centered**4, axis=0) / (std[non_constant_indices])**4
+	#print(n, data)
+	#print(f"Kurtosis: {kurt}")
 	return kurt
 
 def get_kurtosis_feature_split(data, r):
@@ -45,21 +65,17 @@ def get_kurtosis_feature_split(data, r):
 									- feature_index: the attribute index to split
 									- feature_split: the attribute value to split
 	"""
-
+	
 	kurtosis_values = kurtosis(data)
-
 	# Some values are nan, for now, we set them to 0.0
 	#kurtosis_values = np.nan_to_num(kurtosis_values, nan=0.0)
-
-	kurtosis_values_log = np.log(kurtosis_values+1)
-
+	kurtosis_values = kurtosis_values + 1
+	kurtosis_values_log = np.log(kurtosis_values)
 	kurtosis_values_sum_log = kurtosis_values_log.sum()
-
-	while True:
-		# random_value_feature = np.random.uniform(0, kurtosis_values_sum_log)
-		# MODIFIED
-		r_adjusted = r * kurtosis_values_sum_log
-		feature_index = np.digitize(r_adjusted, np.cumsum(kurtosis_values_log), right=True)
+	np.random.seed(r)
+	while True:			
+		random_feature_split = np.random.uniform(0, kurtosis_values_sum_log)
+		feature_index = np.digitize(random_feature_split, np.cumsum(kurtosis_values_log), right=True)
 		min_ = np.min(data[:, feature_index])
 		max_ = np.max(data[:, feature_index])
 		feature_value = np.random.uniform(min_, max_)
@@ -214,6 +230,19 @@ class RandomHistogramTree(object):
 				traverse(node.right)
 		self.leaves = []
 		traverse(self.tree_)
+  
+	def predict_score(self, node, instance, number_instances=None):
+		if node.type ==	1:
+			if node.has_duplicates:					
+				p = node.uniques_/number_instances
+				return np.log(1/(p))
+			else:				
+				p = node.size/number_instances
+				return np.log(1/(p))
+		elif instance[0, node.attribute] < node.value:
+			return self.predict_score(node.left, instance, number_instances)
+		else:
+			return self.predict_score(node.right, instance, number_instances)
 
 	def set_leaf(self, node, data, indices: np.ndarray):
 		"""
@@ -240,7 +269,6 @@ class RandomHistogramTree(object):
 		#node.data = data
 
 		if data.shape[0] == 0:
-			import ipdb; ipdb.set_trace()
 			self.error_node = node
 		if data.shape[0] <= 1:
 			self.set_leaf(node, data, indices)
@@ -285,6 +313,30 @@ class RandomHistogramTree(object):
 		self.tree_ = Root()
 		self.build(self.tree_, data, indices)
 
+	def insert(self, node, new_data):
+		if data.shape[0] == 0:
+			# raise warning
+			warnings.warn('Data is empty')
+			self.error_node = node
+		if node.type == 0:
+			attribute, value = get_kurtosis_feature_split(
+				new_data, self.z[self.index, node.index % (self.z.shape[1]-1)])
+			if attribute != node.attribute:
+				self.build(node, new_data, indices = None)
+				return
+			elif new_data[-1][node.attribute] <= node.value:
+				mask = new_data[:, node.attribute] < node.value
+				self.insert(node.left, new_data[mask])
+			else:
+				mask = new_data[:, node.attribute] < node.value	
+				self.insert(node.right, new_data[~mask])
+		elif node.depth == self.max_height:
+			self.set_leaf(node, new_data, None)
+			return
+		else:	
+			self.build(node, new_data, indices = None)
+			return
+
 
 	# def get_leaves(self, node, leaves):
 
@@ -318,26 +370,6 @@ class RHF(object):
 		self.scores = np.zeros(window_size)
 		self.number_instances = 0
 		self.data = None
-
-	def insert(self, tree, node, tree_index, new_data, xi_index):
-		if np.unique(new_data, axis=0).shape[0] == 1:
-			tree.set_leaf(node, new_data, None)
-			return tree
-		if node.type == 0:
-			attribute, value = get_kurtosis_feature_split(
-				new_data, self.z[tree_index, node.index % (self.z.shape[1]-1)])
-			if attribute != node.attribute:
-				tree.build(node, new_data, indices = None)
-				return tree
-			elif new_data[-1][node.attribute] <= node.value:
-				mask = new_data[:, node.attribute] < node.value
-				self.insert(tree, node.left, tree_index, new_data[mask], xi_index)
-			else:
-				mask = new_data[:, node.attribute] < node.value	
-				self.insert(tree, node.right, tree_index, new_data[~mask], xi_index)
-		else:
-			tree.set_leaf(node, new_data, None)
-		return tree
 
 	def compute_instance_score(self, new_instance):
 		instance_score = 0
@@ -381,10 +413,10 @@ class RHF(object):
 				for leaf in randomHistogramTree.leaves:
 					samples_indexes = leaf.data_indices
 					if leaf.has_duplicates:
-						p = leaf.uniques_/self.window_size
+						p = leaf.uniques_/(self.window_size*2)
 						scores[samples_indexes] += np.log(1/(p))
 					else:
-						p = leaf.size/self.window_size	
+						p = leaf.size/(self.window_size*2)
 						scores[samples_indexes] += np.log(1/(p))
 		return scores
 
@@ -409,10 +441,14 @@ def main(data: str):
 	# maxtrix z E R ^ ( t x 2**h-1 ) (Number of nodes)
 	t = 100
 	h = 5
-	np.random.seed(42)
-	z = np.random.rand(t, 2**h - 1)
-	window_size_perentage = 1  # percentage
-	window_size = int(data.shape[0]*window_size_perentage/100)
+	z = np.zeros((t, 2**h - 1), dtype=int)
+	for i in range(t):
+		for j in range(2**h - 1):
+			z[i, j] = np.random.randint(0, 2**32 - 1)
+   
+	w_size_percentage = 1  # percentage
+	window_size = int(data.shape[0]*w_size_percentage/100)
+	print(f"window_size: {window_size}")
 	max_score_possible = t*np.log(2*window_size)
  
 	labels = data[:, -1]
@@ -427,7 +463,7 @@ def main(data: str):
 	# Go through each instance to simulate a stream
 
 	for i in tqdm(range(0, data.shape[0]), desc="Processing data"):
-      
+	  
 		current_instance = data[i:i+1]
 		current_window = np.vstack([current_window, current_instance]) if current_window.size else current_instance
   
@@ -436,7 +472,6 @@ def main(data: str):
 			current_window = np.array([]).reshape(0, data.shape[1])
 
 		if (i+1) == window_size:
-
 			my_rhf = RHF(num_trees=t, max_height=h,
 						 split_criterion='kurtosis', z=z, window_size=window_size)
    
@@ -449,12 +484,16 @@ def main(data: str):
 			new_instance = data[i:i+1]
 			my_rhf.number_instances += 1
 			new_data = np.vstack([my_rhf.data, new_instance])
-			for tree_i, tree in enumerate(my_rhf.forest):				
-				my_rhf.insert(tree, tree.tree_, tree.index, new_data, i)
-				tree.reset_leaves()	
-			# normalize the score
-			score_i = my_rhf.compute_instance_score(new_instance)/max_score_possible
-			scores.append(score_i)
+			for tree in my_rhf.forest:				
+				tree.insert(tree.tree_, new_data)
+				tree.reset_leaves()
+	
+			predicted_score = 0
+			for tree in my_rhf.forest:	
+				predicted_score += tree.predict_score(tree.tree_, new_instance, my_rhf.window_size*2)
+			# normalize the score			
+			scores.append(predicted_score/max_score_possible)
+   
 			if i % window_size == 0:
 				my_rhf = RHF(num_trees=t, max_height=h,
 						 split_criterion='kurtosis', z=z, window_size=window_size)
@@ -470,13 +509,15 @@ def process_dataset_iteration(args):
 	tic = time.time()
 	av_precision = main(data)
 	toc = time.time()
-				
+	with open(f"./resultsStreamRHF_6/{dataset_name}.csv", "a") as f:
+		f.write(f"{iteration},{av_precision},{toc - tic}\n")
+		print(f"Completed {dataset_name} iteration {iteration} with score {av_precision}")
 	return dataset_name, iteration, av_precision, toc - tic
 
 if __name__ == "__main__":
 	datasets = sys.argv[1:]  # Get dataset names from command line arguments
-	parallel = False
-	shuffle = False
+	parallel = True
+	shuffle = True
 	if parallel:
 		#datasets = ["abalone", "annthyroid", "kdd_ftp", "cardio", "magicgamma", "mammography", "mnist", "musk","satellite", "satimages", "spambase","thyroid"]
 		for dataset_name in datasets:
@@ -497,8 +538,6 @@ if __name__ == "__main__":
 			# Process results
 			for dataset_name, iteration, score, time_elapsed in results:
 				if score is not None:
-					with open(f"./resultsRHFv5_1/{dataset_name}.csv", "a") as f:
-						f.write(f"{iteration},{score},{time_elapsed}\n")
 					print(f"Completed {dataset_name} iteration {iteration} with score {score}")
 				else:
 					print(f"Failed to process {dataset_name} iteration {iteration}")

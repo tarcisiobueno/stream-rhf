@@ -519,11 +519,6 @@ def main(dataset_name: str, shuffle: bool=True):
 			# [my_rhf.insert(tree, tree.tree_, tree.index, new_instance) for tree_i, tree in enumerate(my_rhf.forest)]
 			
 			# This is the predict part
-			predicted_score = 0
-			for tree_i, tree in enumerate(my_rhf.forest):
-				predicted_score += my_rhf.predict_single_tree_score(tree, tree.tree_, tree.index, new_instance)
-			print(predicted_score)
-			# This is the predict part
    
 			# training part
 			for tree_i, tree in enumerate(my_rhf.forest):				
@@ -535,7 +530,11 @@ def main(dataset_name: str, shuffle: bool=True):
 			# check for duplicates - this may affect the score computation
 			#my_rhf.check_hash(np.vstack([reference_window, current_window]))
 			# compute score of the current instance
-			all_output_scores.append(my_rhf.compute_scores(i))
+			predicted_score = 0
+			for tree_i, tree in enumerate(my_rhf.forest):
+				predicted_score += my_rhf.predict_single_tree_score(tree, tree.tree_, tree.index, new_instance)
+			print(predicted_score)
+			all_output_scores.append(predicted_score)
 			if i % window_size == 0:
 				my_rhf = RHF(num_trees=t, max_height=h,
 						 split_criterion='kurtosis', z=z, window_size=window_size)
